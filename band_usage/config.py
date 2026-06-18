@@ -4,23 +4,19 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
-from typing import Dict, Optional
-
-from .pricing import ModelPrice, per_million
+from dataclasses import dataclass
+from typing import Optional
 
 DEFAULT_CONFIG = {
     "ntfy": {
         "server": "https://ntfy.sh",
         "topic": "",
         "token": None,
-        "priority": "default",
+        "priority": "low",
     },
-    "window": "5h",
-    "claude": {"enabled": True, "logs_dir": "~/.claude/projects"},
-    "codex": {"enabled": True, "logs_dir": "~/.codex/sessions", "default_model": "gpt-5-codex"},
-    "budgets": {"claude_usd": None, "codex_usd": None},
-    "pricing_overrides": {},
+    "bar_width": 8,
+    "claude": {"enabled": True, "usage_cache": "~/.claude/usage-cache.json"},
+    "codex": {"enabled": True, "sessions_dir": "~/.codex/sessions"},
 }
 
 
@@ -30,14 +26,11 @@ class Config:
     ntfy_topic: str
     ntfy_token: Optional[str]
     ntfy_priority: str
-    window: str
+    bar_width: int
     claude_enabled: bool
-    claude_logs_dir: str
+    claude_usage_cache: str
     codex_enabled: bool
-    codex_logs_dir: str
-    codex_default_model: str
-    budgets: Dict[str, Optional[float]]
-    pricing_overrides: Dict[str, ModelPrice] = field(default_factory=dict)
+    codex_sessions_dir: str
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -47,20 +40,6 @@ def _deep_merge(base: dict, override: dict) -> dict:
             out[k] = _deep_merge(out[k], v)
         else:
             out[k] = v
-    return out
-
-
-def _build_pricing_overrides(raw: dict) -> Dict[str, ModelPrice]:
-    out: Dict[str, ModelPrice] = {}
-    for key, vals in (raw or {}).items():
-        if not isinstance(vals, dict):
-            continue
-        out[key] = per_million(
-            float(vals.get("input", 0)),
-            float(vals.get("output", 0)),
-            vals.get("cache_write"),
-            vals.get("cache_read"),
-        )
     return out
 
 
@@ -83,13 +62,10 @@ def load_config(path: Optional[str] = None) -> Config:
         ntfy_server=ntfy["server"],
         ntfy_topic=ntfy.get("topic", ""),
         ntfy_token=ntfy.get("token"),
-        ntfy_priority=ntfy.get("priority", "default"),
-        window=data.get("window", "5h"),
+        ntfy_priority=ntfy.get("priority", "low"),
+        bar_width=int(data.get("bar_width", 8)),
         claude_enabled=bool(data["claude"].get("enabled", True)),
-        claude_logs_dir=data["claude"].get("logs_dir", "~/.claude/projects"),
+        claude_usage_cache=data["claude"].get("usage_cache", "~/.claude/usage-cache.json"),
         codex_enabled=bool(data["codex"].get("enabled", True)),
-        codex_logs_dir=data["codex"].get("logs_dir", "~/.codex/sessions"),
-        codex_default_model=data["codex"].get("default_model", "gpt-5-codex"),
-        budgets=data.get("budgets", {}) or {},
-        pricing_overrides=_build_pricing_overrides(data.get("pricing_overrides", {})),
+        codex_sessions_dir=data["codex"].get("sessions_dir", "~/.codex/sessions"),
     )

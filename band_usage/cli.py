@@ -4,7 +4,7 @@ Examples::
 
     python -m band_usage --config config.json --dry-run
     python -m band_usage --config config.json            # send once
-    python -m band_usage --config config.json --loop 300 # send every 5 min
+    python -m band_usage --config config.json --loop 600 # send every 10 min
 """
 
 from __future__ import annotations
@@ -12,43 +12,32 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from typing import Optional
+from typing import List, Optional
 
-from .aggregate import window_start
-from .claude_usage import parse_claude
-from .codex_usage import parse_codex
+from .claude_usage import read_claude_usage
+from .codex_usage import read_codex_usage
 from .config import Config, load_config
-from .format import build_message
-from .models import Totals
+from .format import build_card
+from .models import ToolUsage
 from .notify import send_ntfy
 
 
-def collect(cfg: Config, window: str):
-    since, label = window_start(window)
-    claude_records = (
-        parse_claude(cfg.claude_logs_dir, since) if cfg.claude_enabled else []
-    )
-    codex_records = (
-        parse_codex(cfg.codex_logs_dir, since, cfg.codex_default_model)
-        if cfg.codex_enabled
-        else []
-    )
-    claude_totals = Totals.of(claude_records, cfg.pricing_overrides)
-    codex_totals = Totals.of(codex_records, cfg.pricing_overrides)
-    return claude_totals, codex_totals, label
+def collect(cfg: Config) -> List[ToolUsage]:
+    tools: List[ToolUsage] = []
+    if cfg.claude_enabled:
+        tools.append(read_claude_usage(cfg.claude_usage_cache))
+    if cfg.codex_enabled:
+        tools.append(read_codex_usage(cfg.codex_sessions_dir))
+    return tools
 
 
-def run_once(cfg: Config, window: str, dry_run: bool) -> int:
-    claude_totals, codex_totals, label = collect(cfg, window)
-    title, body = build_message(claude_totals, codex_totals, label, cfg.budgets)
+def run_once(cfg: Config, dry_run: bool) -> int:
+    tools = collect(cfg)
+    title, body = build_card(tools, bar_width=cfg.bar_width)
 
     if dry_run:
         print(f"[{title}]")
         print(body)
-        print(
-            f"\n(claude: {claude_totals.count} msgs, "
-            f"codex: {codex_totals.count} turns)"
-        )
         return 0
 
     status = send_ntfy(
@@ -67,10 +56,9 @@ def run_once(cfg: Config, window: str, dry_run: bool) -> int:
 def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="band_usage",
-        description="Push Claude Code & Codex usage to a Samsung Galaxy Fit 3 via ntfy.",
+        description="Push Claude Code & Codex subscription limits to a Galaxy Fit 3 via ntfy.",
     )
     parser.add_argument("--config", "-c", help="Path to config JSON file.")
-    parser.add_argument("--window", "-w", help="Override window (e.g. 5h, today, 7d, all).")
     parser.add_argument("--topic", help="Override ntfy topic.")
     parser.add_argument("--server", help="Override ntfy server URL.")
     parser.add_argument(
@@ -91,14 +79,13 @@ def main(argv: Optional[list] = None) -> int:
         cfg.ntfy_topic = args.topic
     if args.server:
         cfg.ntfy_server = args.server
-    window = args.window or cfg.window
 
     if args.loop:
         print(f"Looping every {args.loop}s. Ctrl-C to stop.")
         try:
             while True:
                 try:
-                    run_once(cfg, window, args.dry_run)
+                    run_once(cfg, args.dry_run)
                 except Exception as exc:  # keep the loop alive on transient errors
                     print(f"error: {exc}", file=sys.stderr)
                 time.sleep(args.loop)
@@ -106,7 +93,7 @@ def main(argv: Optional[list] = None) -> int:
             return 0
 
     try:
-        return run_once(cfg, window, args.dry_run)
+        return run_once(cfg, args.dry_run)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

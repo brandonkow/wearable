@@ -1,77 +1,49 @@
-"""Parse Claude Code session logs (``~/.claude/projects/**/*.jsonl``).
+"""Read Claude Code's subscription limits from the statusline cache.
 
-Each line is a JSON event. Assistant turns carry a ``message.usage`` block with
-``input_tokens``, ``output_tokens``, ``cache_creation_input_tokens`` and
-``cache_read_input_tokens``, plus a top-level ``timestamp``.
+Claude Code does NOT persist the 5-hour / weekly limit percentages to its
+JSONL session logs — that data is only handed to a statusline script at
+runtime (fields ``rate_limits.five_hour`` / ``rate_limits.seven_day`` with
+``used_percentage`` + ``resets_at``). The bundled statusline hook
+(``statusline/band_statusline.py``) captures it into a small cache file that
+we read here.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Set, Tuple
 
-from .models import UsageRecord
+from .models import ToolUsage, limit_window
 from .util import parse_ts
 
+_SETUP_HINT = "no data - set up the statusline hook"
 
-def parse_claude(logs_dir: str, since: Optional[datetime] = None) -> List[UsageRecord]:
-    base = Path(os.path.expanduser(logs_dir))
-    records: List[UsageRecord] = []
-    if not base.exists():
-        return records
+_WINDOWS = (("five_hour", "5h"), ("seven_day", "wk"))
 
-    seen: Set[Tuple[str, str]] = set()
-    for path in base.rglob("*.jsonl"):
-        try:
-            with path.open("r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(obj, dict) or obj.get("type") != "assistant":
-                        continue
-                    message = obj.get("message")
-                    if not isinstance(message, dict):
-                        continue
-                    usage = message.get("usage")
-                    if not isinstance(usage, dict):
-                        continue
 
-                    # De-dupe replayed messages across resumed sessions.
-                    dedup = (
-                        str(message.get("id", "")),
-                        str(obj.get("requestId", "")),
-                    )
-                    if dedup != ("", "") and dedup in seen:
-                        continue
-                    seen.add(dedup)
+def read_claude_usage(cache_path: str) -> ToolUsage:
+    path = Path(os.path.expanduser(cache_path))
+    if not path.exists():
+        return ToolUsage("Claude", available=False, note=_SETUP_HINT)
 
-                    ts = parse_ts(obj.get("timestamp"))
-                    if since is not None and ts is not None and ts < since:
-                        continue
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return ToolUsage("Claude", available=False, note="cache unreadable")
 
-                    records.append(
-                        UsageRecord(
-                            timestamp=ts,
-                            source="claude",
-                            model=str(message.get("model") or "claude"),
-                            input_tokens=int(usage.get("input_tokens", 0) or 0),
-                            output_tokens=int(usage.get("output_tokens", 0) or 0),
-                            cache_creation_tokens=int(
-                                usage.get("cache_creation_input_tokens", 0) or 0
-                            ),
-                            cache_read_tokens=int(
-                                usage.get("cache_read_input_tokens", 0) or 0
-                            ),
-                        )
-                    )
-        except OSError:
-            continue
-    return records
+    if not isinstance(data, dict):
+        return ToolUsage("Claude", available=False, note="cache malformed")
+
+    updated_at = parse_ts(data.get("updated_at"))
+    windows = []
+    for key, label in _WINDOWS:
+        raw = data.get(key)
+        if isinstance(raw, dict):
+            windows.append(limit_window(raw, label, updated_at))
+
+    if not windows:
+        return ToolUsage("Claude", available=False, note="no limit data yet")
+
+    return ToolUsage("Claude", windows=windows, updated_at=updated_at)

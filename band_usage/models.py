@@ -1,77 +1,58 @@
-"""Shared data types for usage records and aggregated totals."""
+"""Shared data types for subscription rate-limit windows."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Dict, Iterable, Optional
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 
-from .pricing import ModelPrice, price_for
-
-
-@dataclass
-class UsageRecord:
-    """A single billable interaction parsed from a CLI log."""
-
-    timestamp: Optional[datetime]  # aware UTC, or None if unknown
-    source: str  # "claude" | "codex"
-    model: str
-    input_tokens: int = 0
-    output_tokens: int = 0
-    cache_creation_tokens: int = 0
-    cache_read_tokens: int = 0
-
-    @property
-    def total_tokens(self) -> int:
-        return (
-            self.input_tokens
-            + self.output_tokens
-            + self.cache_creation_tokens
-            + self.cache_read_tokens
-        )
-
-    def cost(self, overrides: Optional[Dict[str, ModelPrice]] = None) -> float:
-        p = price_for(self.model, overrides)
-        return (
-            self.input_tokens * p.input
-            + self.output_tokens * p.output
-            + self.cache_creation_tokens * p.cache_write
-            + self.cache_read_tokens * p.cache_read
-        )
+from .util import parse_ts
 
 
 @dataclass
-class Totals:
-    """Aggregated usage for a set of records."""
+class LimitWindow:
+    """One plan-limit window (e.g. the 5-hour or weekly cap)."""
 
-    input_tokens: int = 0
-    output_tokens: int = 0
-    cache_creation_tokens: int = 0
-    cache_read_tokens: int = 0
-    cost: float = 0.0
-    count: int = 0
+    label: str  # short label for the card, e.g. "5h" / "wk"
+    used_percent: Optional[float]  # 0..100, or None if unknown
+    resets_at: Optional[datetime]  # aware UTC, or None if unknown
 
-    @property
-    def total_tokens(self) -> int:
-        return (
-            self.input_tokens
-            + self.output_tokens
-            + self.cache_creation_tokens
-            + self.cache_read_tokens
-        )
 
-    @classmethod
-    def of(
-        cls,
-        records: Iterable[UsageRecord],
-        overrides: Optional[Dict[str, ModelPrice]] = None,
-    ) -> "Totals":
-        t = cls()
-        for r in records:
-            t.input_tokens += r.input_tokens
-            t.output_tokens += r.output_tokens
-            t.cache_creation_tokens += r.cache_creation_tokens
-            t.cache_read_tokens += r.cache_read_tokens
-            t.cost += r.cost(overrides)
-            t.count += 1
-        return t
+@dataclass
+class ToolUsage:
+    """Subscription usage for one tool (Claude / Codex)."""
+
+    name: str
+    windows: List[LimitWindow] = field(default_factory=list)
+    updated_at: Optional[datetime] = None  # when this snapshot was captured
+    available: bool = True
+    note: str = ""  # shown when not available
+
+
+def limit_window(
+    raw: Dict[str, Any], label: str, ref_ts: Optional[datetime]
+) -> LimitWindow:
+    """Build a :class:`LimitWindow` from a provider's window dict.
+
+    Tolerates the different field names used by Claude (``used_percentage``)
+    and Codex (``used_percent``), and resolves resets given either an absolute
+    ``resets_at`` (epoch or ISO) or a relative ``resets_in_seconds``.
+    """
+    used = raw.get("used_percent")
+    if used is None:
+        used = raw.get("used_percentage")
+    try:
+        used_f: Optional[float] = float(used) if used is not None else None
+    except (TypeError, ValueError):
+        used_f = None
+
+    resets: Optional[datetime] = None
+    if raw.get("resets_at") is not None:
+        resets = parse_ts(raw.get("resets_at"))
+    elif raw.get("resets_in_seconds") is not None and ref_ts is not None:
+        try:
+            resets = ref_ts + timedelta(seconds=float(raw["resets_in_seconds"]))
+        except (TypeError, ValueError):
+            resets = None
+
+    return LimitWindow(label=label, used_percent=used_f, resets_at=resets)

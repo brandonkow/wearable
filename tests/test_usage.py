@@ -1,4 +1,4 @@
-"""Tests for parsing, aggregation, pricing, and formatting.
+"""Tests for limit parsing and card formatting.
 
 Run with:  python -m unittest discover -s tests
 """
@@ -9,14 +9,18 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from band_usage.aggregate import window_start
-from band_usage.claude_usage import parse_claude
-from band_usage.codex_usage import parse_codex
-from band_usage.format import build_message, human_tokens, progress_bar
-from band_usage.models import Totals
-from band_usage.pricing import price_for
+from band_usage.claude_usage import read_claude_usage
+from band_usage.codex_usage import read_codex_usage
+from band_usage.format import bar, build_card, fmt_age, fmt_pct, fmt_reset
+from band_usage.models import ToolUsage, limit_window
 
-NOW = datetime.now(timezone.utc)
+NOW = datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _write_json(path: Path, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(obj, fh)
 
 
 def _write_jsonl(path: Path, rows):
@@ -26,179 +30,124 @@ def _write_jsonl(path: Path, rows):
             fh.write(json.dumps(row) + "\n")
 
 
-class ClaudeParsingTest(unittest.TestCase):
-    def test_parses_and_dedupes_and_windows(self):
+class ClaudeCacheTest(unittest.TestCase):
+    def test_reads_both_windows(self):
         with tempfile.TemporaryDirectory() as d:
-            base = Path(d)
-            recent = (NOW - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
-            old = (NOW - timedelta(hours=10)).isoformat().replace("+00:00", "Z")
-            rows = [
-                {"type": "summary"},  # ignored
+            cache = Path(d) / "usage-cache.json"
+            resets = int((NOW + timedelta(hours=2)).timestamp())
+            _write_json(
+                cache,
                 {
-                    "type": "assistant",
-                    "timestamp": recent,
-                    "requestId": "r1",
-                    "message": {
-                        "id": "m1",
-                        "model": "claude-sonnet-4-6",
-                        "usage": {
-                            "input_tokens": 100,
-                            "output_tokens": 50,
-                            "cache_creation_input_tokens": 10,
-                            "cache_read_input_tokens": 200,
-                        },
-                    },
+                    "five_hour": {"used_percent": 24.0, "resets_at": resets},
+                    "seven_day": {"used_percent": 41.0, "resets_at": resets},
+                    "updated_at": NOW.isoformat().replace("+00:00", "Z"),
                 },
-                {  # duplicate of m1/r1 -> de-duped
-                    "type": "assistant",
-                    "timestamp": recent,
-                    "requestId": "r1",
-                    "message": {
-                        "id": "m1",
-                        "model": "claude-sonnet-4-6",
-                        "usage": {"input_tokens": 100, "output_tokens": 50},
-                    },
-                },
-                {  # too old -> filtered by window
-                    "type": "assistant",
-                    "timestamp": old,
-                    "requestId": "r2",
-                    "message": {
-                        "id": "m2",
-                        "model": "claude-opus-4-8",
-                        "usage": {"input_tokens": 999, "output_tokens": 999},
-                    },
-                },
-            ]
-            _write_jsonl(base / "proj" / "session.jsonl", rows)
+            )
+            usage = read_claude_usage(str(cache))
+            self.assertTrue(usage.available)
+            self.assertEqual(len(usage.windows), 2)
+            self.assertEqual(usage.windows[0].label, "5h")
+            self.assertEqual(usage.windows[0].used_percent, 24.0)
+            self.assertIsNotNone(usage.windows[0].resets_at)
 
-            since = NOW - timedelta(hours=5)
-            records = parse_claude(str(base), since)
-            self.assertEqual(len(records), 1)
-            r = records[0]
-            self.assertEqual(r.input_tokens, 100)
-            self.assertEqual(r.cache_read_tokens, 200)
-
-            totals = Totals.of(records)
-            self.assertEqual(totals.total_tokens, 100 + 50 + 10 + 200)
-            self.assertGreater(totals.cost, 0)
-
-    def test_missing_dir_returns_empty(self):
-        self.assertEqual(parse_claude("/no/such/dir"), [])
+    def test_missing_cache_is_unavailable(self):
+        usage = read_claude_usage("/no/such/cache.json")
+        self.assertFalse(usage.available)
+        self.assertIn("statusline", usage.note)
 
 
-class CodexParsingTest(unittest.TestCase):
-    def test_sums_last_token_usage_deltas(self):
+class CodexSessionTest(unittest.TestCase):
+    def test_reads_latest_rate_limits(self):
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)
-            t1 = (NOW - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
-            t2 = (NOW - timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
+            t1 = (NOW - timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
+            t2 = (NOW - timedelta(minutes=2)).isoformat().replace("+00:00", "Z")
             rows = [
-                {"type": "session_meta", "payload": {"turn_context": {"model": "gpt-5-codex"}}},
+                {"type": "session_meta", "payload": {}},
                 {
                     "type": "event_msg",
                     "timestamp": t1,
-                    "payload": {
-                        "type": "token_count",
-                        "info": {
-                            "total_token_usage": {"input_tokens": 100, "output_tokens": 20},
-                            "last_token_usage": {
-                                "input_tokens": 100,
-                                "cached_input_tokens": 40,
-                                "output_tokens": 20,
-                            },
-                        },
-                    },
+                    "payload": {"type": "token_count", "info": {"rate_limits": {
+                        "primary": {"used_percent": 10.0, "window_minutes": 300},
+                        "secondary": {"used_percent": 20.0, "window_minutes": 10080},
+                    }}},
                 },
-                {
+                {  # later event -> this one wins
                     "type": "event_msg",
                     "timestamp": t2,
-                    "payload": {
-                        "type": "token_count",
-                        "info": {
-                            "total_token_usage": {"input_tokens": 250, "output_tokens": 60},
-                            "last_token_usage": {
-                                "input_tokens": 150,
-                                "cached_input_tokens": 0,
-                                "output_tokens": 40,
-                            },
-                        },
-                    },
+                    "payload": {"type": "token_count", "info": {"rate_limits": {
+                        "primary": {"used_percent": 62.0, "resets_in_seconds": 3600},
+                        "secondary": {"used_percent": 38.0, "resets_in_seconds": 86400},
+                    }}},
                 },
             ]
             _write_jsonl(base / "2026" / "06" / "18" / "rollout-x.jsonl", rows)
 
-            records = parse_codex(str(base), NOW - timedelta(hours=5))
-            self.assertEqual(len(records), 2)
-            totals = Totals.of(records)
-            # fresh input: (100-40) + (150-0) = 210; output 60; cached 40
-            self.assertEqual(totals.input_tokens, 210)
-            self.assertEqual(totals.output_tokens, 60)
-            self.assertEqual(totals.cache_read_tokens, 40)
-            self.assertTrue(all(r.model == "gpt-5-codex" for r in records))
+            usage = read_codex_usage(str(base))
+            self.assertTrue(usage.available)
+            self.assertEqual(usage.windows[0].label, "5h")
+            self.assertEqual(usage.windows[0].used_percent, 62.0)
+            self.assertEqual(usage.windows[1].used_percent, 38.0)
+            # resets_in_seconds resolved relative to the event timestamp
+            self.assertIsNotNone(usage.windows[0].resets_at)
 
-    def test_falls_back_to_total_when_no_deltas(self):
+    def test_no_dir(self):
+        self.assertFalse(read_codex_usage("/no/such/dir").available)
+
+    def test_no_rate_limits(self):
         with tempfile.TemporaryDirectory() as d:
-            base = Path(d)
-            rows = [
-                {"type": "event_msg", "payload": {"info": {
-                    "total_token_usage": {"input_tokens": 500, "output_tokens": 100}}}},
-            ]
-            _write_jsonl(base / "rollout-y.jsonl", rows)
-            records = parse_codex(str(base), since=None)
-            self.assertEqual(len(records), 1)
-            self.assertEqual(records[0].input_tokens, 500)
+            _write_jsonl(Path(d) / "r.jsonl", [{"type": "event_msg", "payload": {}}])
+            self.assertFalse(read_codex_usage(d).available)
 
 
-class PricingTest(unittest.TestCase):
-    def test_longest_substring_match(self):
-        codex = price_for("gpt-5-codex")
-        plain = price_for("gpt-5")
-        # gpt-5-codex defines cache_read; both share input price here.
-        self.assertEqual(codex.input, plain.input)
-        self.assertNotEqual(codex.cache_read, 0)
+class WindowHelperTest(unittest.TestCase):
+    def test_resets_at_epoch(self):
+        epoch = int((NOW + timedelta(hours=3)).timestamp())
+        w = limit_window({"used_percent": 5, "resets_at": epoch}, "5h", NOW)
+        self.assertEqual(w.used_percent, 5.0)
+        self.assertAlmostEqual((w.resets_at - NOW).total_seconds(), 3 * 3600, delta=2)
 
-    def test_unknown_model_uses_default(self):
-        self.assertGreater(price_for("totally-unknown").input, 0)
+    def test_resets_in_seconds(self):
+        w = limit_window({"used_percentage": 7, "resets_in_seconds": 1800}, "wk", NOW)
+        self.assertEqual(w.used_percent, 7.0)
+        self.assertAlmostEqual((w.resets_at - NOW).total_seconds(), 1800, delta=2)
 
 
 class FormatTest(unittest.TestCase):
-    def test_human_tokens(self):
-        self.assertEqual(human_tokens(1_500_000), "1.5M")
-        self.assertEqual(human_tokens(2500), "2.5k")
-        self.assertEqual(human_tokens(42), "42")
+    def test_bar(self):
+        self.assertEqual(bar(50, width=8), "████░░░░")
+        self.assertEqual(bar(0, width=4), "░░░░")
+        self.assertEqual(bar(150, width=4), "████")
+        self.assertEqual(bar(None, width=4), "····")
 
-    def test_progress_bar_clamps(self):
-        self.assertEqual(progress_bar(50, width=10), "█████░░░░░")
-        self.assertEqual(progress_bar(150, width=4), "████")
-        self.assertEqual(progress_bar(-5, width=4), "░░░░")
+    def test_fmt_pct_and_reset(self):
+        self.assertEqual(fmt_pct(24.0), "24%")
+        self.assertEqual(fmt_pct(None), "?")
+        self.assertEqual(fmt_reset(NOW + timedelta(minutes=47), NOW), "47m")
+        self.assertEqual(fmt_reset(NOW + timedelta(hours=2), NOW), "2h")
+        self.assertEqual(fmt_reset(NOW - timedelta(minutes=1), NOW), "now")
+        self.assertEqual(fmt_reset(None, NOW), "")
 
-    def test_build_message_with_budget(self):
-        claude = Totals(cost=10.0)
-        codex = Totals(cost=2.0)
-        title, body = build_message(
-            claude, codex, "last 5h", {"claude_usd": 20, "codex_usd": 10}
+    def test_fmt_age_only_when_stale(self):
+        self.assertEqual(fmt_age(NOW - timedelta(minutes=2), NOW), "")
+        self.assertEqual(fmt_age(NOW - timedelta(hours=3), NOW), "3h old")
+
+    def test_build_card(self):
+        claude = ToolUsage(
+            "Claude",
+            windows=[
+                limit_window({"used_percent": 24, "resets_at": int((NOW + timedelta(hours=2)).timestamp())}, "5h", NOW),
+                limit_window({"used_percent": 41}, "wk", NOW),
+            ],
+            updated_at=NOW,
         )
-        self.assertIn("AI usage - last 5h", title)
-        self.assertIn("Claude $10.00/$20.00 50%", body)
-        self.assertIn("Total $12.00", body)
-
-    def test_build_message_without_budget(self):
-        claude = Totals(input_tokens=1_000_000, cost=3.0)
-        codex = Totals(output_tokens=500_000, cost=1.0)
-        _, body = build_message(claude, codex, "today", {})
-        self.assertIn("tok", body)
-        self.assertIn("Total $4.00", body)
-
-
-class WindowTest(unittest.TestCase):
-    def test_window_specs(self):
-        self.assertEqual(window_start("all")[0], None)
-        start, label = window_start("5h", now=NOW)
-        self.assertEqual(label, "last 5h")
-        self.assertAlmostEqual((NOW - start).total_seconds(), 5 * 3600, delta=2)
-        _, label7 = window_start("7d", now=NOW)
-        self.assertEqual(label7, "last 7d")
+        codex_unavail = ToolUsage("Codex", available=False, note="no recent session")
+        title, body = build_card([claude, codex_unavail], bar_width=8, now=NOW)
+        self.assertEqual(title, "AI limits")
+        self.assertIn("Claude .2h", body)
+        self.assertIn("5h ██░░░░░░ 24%", body)
+        self.assertIn("wk ", body)
+        self.assertIn("Codex: no recent session", body)
 
 
 if __name__ == "__main__":
