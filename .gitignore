@@ -1,0 +1,12 @@
+# Local config (may hold an ntfy token) and logs
+config.json
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+build/
+dist/

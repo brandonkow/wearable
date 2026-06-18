@@ -1,0 +1,24 @@
+{
+  "ntfy": {
+    "server": "https://ntfy.sh",
+    "topic": "CHANGE-ME-to-something-private-like-ai-usage-7f3k9",
+    "token": null,
+    "priority": "low"
+  },
+  "window": "5h",
+  "claude": {
+    "enabled": true,
+    "logs_dir": "~/.claude/projects"
+  },
+  "codex": {
+    "enabled": true,
+    "logs_dir": "~/.codex/sessions",
+    "default_model": "gpt-5-codex"
+  },
+  "budgets": {
+    "claude_usd": 20,
+    "codex_usd": 10
+  },
+  "pricing_overrides": {
+  }
+}

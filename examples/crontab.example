@@ -1,0 +1,5 @@
+# Push AI usage to the band every 15 minutes.
+# Install with:  crontab examples/crontab.example
+# (edit the path to match where you cloned the repo)
+
+*/15 * * * * /home/user/wearable/examples/run.sh >> /tmp/band_usage.log 2>&1
