@@ -52,7 +52,24 @@ That means **Claude's number is as fresh as your last active Claude Code
 session** — the card shows a `(3h old)` marker when the data is stale, and a
 "set up the statusline hook" hint until the cache exists.
 
-## Setup
+## Quick start (Windows, one shot)
+
+On Windows you can skip the manual steps below — `setup.ps1` clones the repo,
+writes `config.json`, installs the Claude statusline hook, sends a test card,
+and schedules it to run every 15 minutes:
+
+```powershell
+$u = "https://raw.githubusercontent.com/brandonkow/wearable/claude/samsung-fit-usage-display-xgoe5i/setup.ps1"
+Invoke-WebRequest $u -OutFile "$env:USERPROFILE\Downloads\setup.ps1"
+powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\Downloads\setup.ps1" -Topic "ai-limits-7f3k9q2"
+```
+
+You still need to do three things by hand: install the **ntfy** app on the
+phone and subscribe to your topic, enable ntfy in **Galaxy Wearable →
+Notifications**, and run one Claude Code message so its limits get cached. The
+script prints these reminders when it finishes.
+
+## Setup (manual / macOS / Linux)
 
 ### 1. Get the code
 
