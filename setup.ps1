@@ -110,13 +110,31 @@ catch {
 
 # 7. Schedule ---------------------------------------------------------------
 if (-not $NoSchedule) {
-    Info "Registering scheduled task 'BandUsage' (every $IntervalMinutes min)..."
+    Info "Registering scheduled task 'BandUsage' (every $IntervalMinutes min, at logon, and on wake)..."
     try {
-        $action  = New-ScheduledTaskAction -Execute $python -Argument "-m band_usage --config config.json" -WorkingDirectory $InstallDir
-        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes)
+        $action = New-ScheduledTaskAction -Execute $python -Argument "-m band_usage --config config.json" -WorkingDirectory $InstallDir
+
+        # Trigger 1: run now, then repeat every N minutes while the PC is on.
+        $tRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes)
+        # Trigger 2: at every logon (fresh card the moment you sign in).
+        $tLogon = New-ScheduledTaskTrigger -AtLogOn
+        $triggers = @($tRepeat, $tLogon)
+
+        # Trigger 3 (best effort): on resume from sleep/hibernate. Windows logs
+        # Power-Troubleshooter event ID 1 when the system wakes; we fire on it.
+        try {
+            $tWake = New-CimInstance -CimClass (Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace Root/Microsoft/Windows/TaskScheduler) -ClientOnly
+            $tWake.Enabled = $true
+            $tWake.Subscription = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name=''Microsoft-Windows-Power-Troubleshooter''] and (EventID=1)]]</Select></Query></QueryList>'
+            $triggers += $tWake
+        }
+        catch {
+            Warn "Wake-from-sleep trigger unavailable here; using logon + interval only."
+        }
+
         $taskSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-        Register-ScheduledTask -TaskName "BandUsage" -Action $action -Trigger $trigger -Settings $taskSettings -Description "Push Claude/Codex limits to Galaxy Fit 3" -Force | Out-Null
-        Ok "Scheduled. Runs every $IntervalMinutes minutes while this PC is on."
+        Register-ScheduledTask -TaskName "BandUsage" -Action $action -Trigger $triggers -Settings $taskSettings -Description "Push Claude/Codex limits to Galaxy Fit 3" -Force | Out-Null
+        Ok "Scheduled: every $IntervalMinutes min, at logon, and on wake-from-sleep."
     }
     catch {
         Warn "Could not register task: $($_.Exception.Message)"
